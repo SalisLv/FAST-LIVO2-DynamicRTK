@@ -1,0 +1,26 @@
+{
+  "FAST-LIVO2-RTK": {
+    "commit": "909731486ddec09ab69b5cc8ad4d5a4fe5fbfeb6",
+    "remote": "https://github.com/xuankuzcr/FAST-LIVO2-RTK.git"
+  },
+  "gnss_comm": {
+    "commit": "a2035fec1cc427bba184d25ff1fde8dcf23c9ce1",
+    "remote": "https://github.com/HKUST-Aerial-Robotics/gnss_comm.git"
+  },
+  "gtsam": {
+    "commit": "4f66a491ffc83cf092d0d818b11dc35135521612",
+    "remote": "https://github.com/borglab/gtsam.git"
+  },
+  "Sophus": {
+    "commit": "a621ff2e56c56c839a6c40418d42c3c254424b5c",
+    "remote": "https://github.com/strasdat/Sophus.git"
+  },
+  "rpg_vikit": {
+    "commit": "6c886c8e5d83997806e00294826d528cea3581dd",
+    "remote": "https://github.com/xuankuzcr/rpg_vikit.git"
+  },
+  "base_image": {
+    "tag": "fast-livo2:noetic",
+    "id": "sha256:ea15628432da2c3006ed8b6f300e025e9f67e8d7b9833630a25c04bd7d80f1b5"
+  }
+}

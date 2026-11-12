@@ -1,0 +1,21 @@
+<launch>
+  <arg name="pcd_file" default="/project/output/HH-LVGO-01-gpu-limited/global_pcd/after_optimization.pcd"/>
+  <arg name="compare" default="false"/>
+  <arg name="rviz_config" default="$(find fast_livo)/rviz_cfg/global_pcd.rviz"/>
+
+  <node pkg="pcl_ros" type="pcd_to_pointcloud" name="global_map_publisher" output="screen">
+    <param name="file_name" value="$(arg pcd_file)"/>
+    <param name="interval" value="0"/>
+    <param name="frame_id" value="map"/>
+    <param name="latch" value="true"/>
+    <remap from="cloud_pcd" to="/global_map"/>
+  </node>
+
+  <group if="$(arg compare)">
+    <node pkg="fast_livo" type="publish_tum_paths.py" name="trajectory_comparison" output="screen"
+          args="/project/output/HH-LVGO-01-gpu-limited/TUM/livo_trajectory_before.txt /project/output/HH-LVGO-01-gpu-limited/TUM/opt_trajectory_after.txt --frame-id map"/>
+  </group>
+
+  <node pkg="rviz" type="rviz" name="global_map_rviz" required="true"
+        args="-d $(arg rviz_config)" output="screen"/>
+</launch>

@@ -162,3 +162,13 @@ target_link_libraries(fastlivo_mapping
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
 endif()
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(test_gnss_quality tests/test_gnss_quality.cpp)
+  add_test(NAME gnss_quality_policy COMMAND test_gnss_quality)
+  add_executable(replay_gnss_backend tests/replay_gnss_backend.cpp)
+  add_dependencies(replay_gnss_backend ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(replay_gnss_backend laser_mapping vio lio pre imu_proc optimization ${catkin_LIBRARIES}
+    ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${Sophus_LIBRARIES} ${Boost_LIBRARIES}
+    ${GeographicLib_LIBRARIES} gtsam)
+endif()

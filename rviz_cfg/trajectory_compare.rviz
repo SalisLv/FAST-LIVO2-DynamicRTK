@@ -1,0 +1,76 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/PointCloud2
+      Name: Optimized Global Map
+      Enabled: true
+      Value: true
+      Topic: /global_map
+      Queue Size: 1
+      Decay Time: 0
+      Unreliable: false
+      Use Fixed Frame: true
+      Style: Points
+      Size (Pixels): 1
+      Size (m): 0.01
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Alpha: 0.3
+    - Class: rviz/Path
+      Name: Before Optimization (Blue)
+      Enabled: true
+      Value: true
+      Topic: /trajectory/before
+      Queue Size: 1
+      Buffer Length: 1
+      Line Style: Billboards
+      Line Width: 0.2
+      Color: 40; 130; 255
+      Alpha: 1
+      Pose Style: None
+      Unreliable: false
+    - Class: rviz/Path
+      Name: After Optimization (Orange)
+      Enabled: true
+      Value: true
+      Topic: /trajectory/after
+      Queue Size: 1
+      Buffer Length: 1
+      Line Style: Billboards
+      Line Width: 0.2
+      Color: 255; 150; 35
+      Alpha: 1
+      Pose Style: None
+      Unreliable: false
+  Enabled: true
+  Global Options:
+    Background Color: 32; 32; 32
+    Default Light: true
+    Fixed Frame: map
+    Frame Rate: 20
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 100
+      Focal Point:
+        X: -36
+        Y: 28
+        Z: 1
+      Name: Current View
+      Pitch: 0.9
+      Yaw: 0.3
+Window Geometry:
+  Height: 900
+  Width: 1500

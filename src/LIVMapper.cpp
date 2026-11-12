@@ -859,7 +859,7 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
         gps_trans_.Reset(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude);
         std::ofstream gps_file_header(rtk_save_file, std::ios::out); 
         if (gps_file_header.is_open()) {
-            gps_file_header << "# timestamp x y z vx vy vz h_acc v_acc" << std::endl;
+            gps_file_header << "# timestamp x y z vx vy vz h_acc v_acc fix_type valid_fix diff_soln carr_soln num_sv p_dop vel_acc" << std::endl;
             gps_file_header.close();
         }
     }
@@ -910,9 +910,9 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
     gps_odom.twist.twist.linear.x = gpsMsg->vel_e;
     gps_odom.twist.twist.linear.y = gpsMsg->vel_n;
     gps_odom.twist.twist.linear.z = -gpsMsg->vel_d;
-    gps_odom.pose.covariance[0] = gpsMsg->h_acc; 
-    gps_odom.pose.covariance[7] = gpsMsg->h_acc; 
-    gps_odom.pose.covariance[14] = gpsMsg->v_acc; 
+    gps_odom.pose.covariance[0] = gpsMsg->h_acc * gpsMsg->h_acc;
+    gps_odom.pose.covariance[7] = gpsMsg->h_acc * gpsMsg->h_acc;
+    gps_odom.pose.covariance[14] = gpsMsg->v_acc * gpsMsg->v_acc;
 
     pub_rtk.publish(gps_odom);
     
@@ -929,8 +929,14 @@ void LIVMapper::rtk_cbk(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
                   << gpsMsg->vel_n << " "                  // 6. vy (North)
                   << -gpsMsg->vel_d << " "                 // 7. vz (Up, 注意取反)
                   << gpsMsg->h_acc << " "                  // 8. h_acc
-                  << gpsMsg->v_acc                         // 9. v_acc
-                  << std::endl;
+                  << gpsMsg->v_acc << " "                  // 9. v_acc
+                  << static_cast<int>(gpsMsg->fix_type) << " "
+                  << gpsMsg->valid_fix << " "
+                  << gpsMsg->diff_soln << " "
+                  << static_cast<int>(gpsMsg->carr_soln) << " "
+                  << static_cast<int>(gpsMsg->num_sv) << " "
+                  << gpsMsg->p_dop << " "
+                  << gpsMsg->vel_acc << std::endl;
           gps_file.close();
       }
     // }

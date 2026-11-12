@@ -99,3 +99,25 @@ opt:
   rtk_cov: 0.05
   livo2_RPY_cov: 0.00000001
   livo2_XYZ_cov: 0.0001
+
+  # Metres (standard deviations), except max_time_difference/recovery_seconds (s).
+  # Disable to compare against the original fixed-noise, spline-based backend.
+  gnss_quality:
+    enabled: true
+    accuracy_scale: 1.0
+    fixed_sigma_xy: 0.10
+    fixed_sigma_z: 1.0
+    float_sigma_xy: 0.50
+    float_sigma_z: 2.0
+    single_sigma_xy: 2.0
+    single_sigma_z: 5.0
+    max_sigma_xy: 20.0
+    max_sigma_z: 50.0
+    min_satellites: 8
+    max_pdop: 3.0
+    auxiliary_sigma_scale: 2.0
+    max_time_difference: 0.06
+    recovery_seconds: 1.0
+    recovery_gap_seconds: 0.5
+    huber_k: 2.5
+    alignment_max_sigma_xy: 1.0

@@ -1,0 +1,9 @@
+.git
+.runtime/logs
+.runtime/*.html
+.runtime/deps/*/.git
+datasets
+output
+Log
+build
+devel

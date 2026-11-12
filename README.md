@@ -90,6 +90,11 @@ roslaunch fast_livo HH.launch
 ```bash
 rosbag play HH-LVGO-01.bag
 ```
+The offline backend supports per-observation GNSS noise based on receiver quality,
+robust outlier weighting, and a fixed-weight comparison mode. See the
+[GNSS dynamic weighting guide (中文)](docs/gnss_dynamic_weighting.md) for parameters,
+quality logs, and backend replay validation.
+
 ## 3. Appendix
 **Time Synchronization:**
 

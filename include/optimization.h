@@ -28,6 +28,7 @@
 #include <Eigen/StdVector>
 #include <atomic>
 #include <memory>
+#include "gnss_quality.h"
 #include "LIVMapper.h"
 #include "FastDTW/example.hpp"
 
@@ -42,6 +43,16 @@ struct KeyFrame
 };
 
 using KeyFrameVector = std::vector<KeyFrame, Eigen::aligned_allocator<KeyFrame>>;
+
+struct GnssObservation {
+    nav_msgs::Odometry odom;
+    gnss::Quality quality;
+    gnss::Decision decision;
+    int keyframe = -1;
+    double time_difference = 0.0;
+    gtsam::Vector3 factor_sigmas = gtsam::Vector3::Zero();
+    std::string association = "not_associated";
+};
 
 inline Eigen::Affine3f poseToAffine3f(const gtsam::Pose3& pose)
 { 
@@ -83,12 +94,14 @@ inline gtsam::Pose3 computeSVD(const std::vector<Eigen::Vector3d>& target,
 class optimization
 {
 public:
-    optimization(ros::NodeHandle &nh);
+    optimization(ros::NodeHandle &nh, bool start_thread = true);
     ~optimization();
 
     void loadData(const std::string& data_dir);
     void offlineOptimizationTask();
     void initialAlign();
+    bool alignQualityGnss();
+    void writeGnssQualityLog();
     double calculateDtwTimeOffset(const std::vector<std::vector<double>>& gpsdata, const std::vector<std::vector<double>>& slamdata);
     double estimateVelocityTimeOffset(const std::vector<std::vector<double>>& gps_position_data,
                                       const std::vector<std::vector<double>>& slam_position_data,
@@ -149,7 +162,7 @@ public:
     std::thread optimization_thread_;
     std::atomic_bool optimization_shutdown_requested_{false};
 
-    std::deque<nav_msgs::Odometry> gpsQueue;
+    std::deque<GnssObservation> gpsQueue;
     std::deque<nav_msgs::Odometry> gpsQueue_B;
     GeographicLib::LocalCartesian gps_trans_;
 
@@ -164,6 +177,10 @@ public:
     double rtk_cov;
     double livo2_RPY_cov;
     double livo2_XYZ_cov;
+    gnss::Options gnss_options;
+    bool alignment_ok_ = false;
+    bool poses_are_antenna_ = false;
+    bool gps_origin_initialized_ = false;
        
 
     bool debug_mode = false;

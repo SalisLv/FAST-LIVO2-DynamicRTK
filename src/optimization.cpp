@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <Eigen/SVD>
+#include <gtsam/linear/LossFunctions.h>
+#include <stdexcept>
 
 #include <sys/select.h>
 #include <unistd.h>
@@ -329,7 +333,7 @@ void writeVelocityAlignmentCsv(const std::string& csv_path,
 }
 } // namespace
 
-optimization::optimization(ros::NodeHandle &nh)
+optimization::optimization(ros::NodeHandle &nh, bool start_thread)
 {
     nh.param<std::string>("laserMapping/outputfilepath", outputfilepath, "");
     debug_optdata_path_ = outputfilepath + "/debug/";
@@ -360,6 +364,34 @@ optimization::optimization(ros::NodeHandle &nh)
     nh.param<double>("opt/livo2_RPY_cov", livo2_RPY_cov, 1e-4);
     nh.param<double>("opt/livo2_XYZ_cov", livo2_XYZ_cov, 1e-4);
 
+    nh.param<bool>("opt/gnss_quality/enabled", gnss_options.enabled, true);
+    nh.param<double>("opt/gnss_quality/accuracy_scale", gnss_options.accuracy_scale, gnss_options.accuracy_scale);
+    nh.param<double>("opt/gnss_quality/fixed_sigma_xy", gnss_options.fixed_sigma_xy, gnss_options.fixed_sigma_xy);
+    nh.param<double>("opt/gnss_quality/fixed_sigma_z", gnss_options.fixed_sigma_z, gnss_options.fixed_sigma_z);
+    nh.param<double>("opt/gnss_quality/float_sigma_xy", gnss_options.float_sigma_xy, gnss_options.float_sigma_xy);
+    nh.param<double>("opt/gnss_quality/float_sigma_z", gnss_options.float_sigma_z, gnss_options.float_sigma_z);
+    nh.param<double>("opt/gnss_quality/single_sigma_xy", gnss_options.single_sigma_xy, gnss_options.single_sigma_xy);
+    nh.param<double>("opt/gnss_quality/single_sigma_z", gnss_options.single_sigma_z, gnss_options.single_sigma_z);
+    nh.param<double>("opt/gnss_quality/max_sigma_xy", gnss_options.max_sigma_xy, gnss_options.max_sigma_xy);
+    nh.param<double>("opt/gnss_quality/max_sigma_z", gnss_options.max_sigma_z, gnss_options.max_sigma_z);
+    nh.param<int>("opt/gnss_quality/min_satellites", gnss_options.min_satellites, gnss_options.min_satellites);
+    nh.param<double>("opt/gnss_quality/max_pdop", gnss_options.max_pdop, gnss_options.max_pdop);
+    nh.param<double>("opt/gnss_quality/auxiliary_sigma_scale", gnss_options.auxiliary_sigma_scale, gnss_options.auxiliary_sigma_scale);
+    nh.param<double>("opt/gnss_quality/max_time_difference", gnss_options.max_time_difference, gnss_options.max_time_difference);
+    nh.param<double>("opt/gnss_quality/recovery_seconds", gnss_options.recovery_seconds, gnss_options.recovery_seconds);
+    nh.param<double>("opt/gnss_quality/recovery_gap_seconds", gnss_options.recovery_gap_seconds, gnss_options.recovery_gap_seconds);
+    nh.param<double>("opt/gnss_quality/huber_k", gnss_options.huber_k, gnss_options.huber_k);
+    nh.param<double>("opt/gnss_quality/alignment_max_sigma_xy", gnss_options.alignment_max_sigma_xy, gnss_options.alignment_max_sigma_xy);
+    gnss_options.validate();
+    if (gps_extrinT.size() != 3)
+        throw std::invalid_argument("gps/extrinsic_T must contain three finite values");
+    for (double value : gps_extrinT)
+        if (!std::isfinite(value)) throw std::invalid_argument("Invalid GNSS lever arm");
+    if (!std::isfinite(gps_offset) || !std::isfinite(rtk_cov) || rtk_cov <= 0.0 ||
+        !std::isfinite(livo2_RPY_cov) || livo2_RPY_cov <= 0.0 ||
+        !std::isfinite(livo2_XYZ_cov) || livo2_XYZ_cov <= 0.0)
+        throw std::invalid_argument("Invalid GNSS time offset or graph variances");
+
     // subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gps_topic, 2000, &optimization::gpsHandler, this);
     subGPS_pvt = nh.subscribe<gnss_comm::GnssPVTSolnMsg>(gps_topic, 2000, &optimization::gpsHandler, this);
 
@@ -383,7 +415,8 @@ optimization::optimization(ros::NodeHandle &nh)
     last_keyframe_wall_time_ = ros::WallTime::now();
 
     ROS_INFO("Optimization mode: [OFFLINE]. Accumulating factors for batch optimization.");
-    optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
+    if (start_thread)
+        optimization_thread_ = std::thread(&optimization::offlineOptimizationTask, this);
 }
 
 optimization::~optimization() 
@@ -406,7 +439,14 @@ void optimization::offlineOptimizationTask() {
         accepting_keyframes_ = false;
     }
     std::cout << "[Offline Optimization] Starting batch optimization..." << std::endl;
+    if (keyFrames.empty()) {
+        ROS_WARN("[Offline Optimization] No LIVO keyframes; nothing to optimize.");
+        return;
+    }
     initialAlign();
+    if (!alignment_ok_) {
+        ROS_WARN("[Offline Optimization] GNSS alignment unavailable; preserving the LIVO trajectory.");
+    }
     std::cout << "[Offline Optimization] Initial alignment done." << std::endl;
     writeTumTrajectory(livo_tum_before_output_path_);
     saveOptimizedGlobalMap();
@@ -423,6 +463,7 @@ void optimization::offlineOptimizationTask() {
     gtsam::LevenbergMarquardtOptimizer optimizer(gtSAMgraph, initialEstimate);
     gtsam::Values result = optimizer.optimize();
     initialEstimate = result;
+    writeGnssQualityLog();
     std::cout << "[Offline Optimization] First optimization pass done." <<  std::endl;
 
     is_optimized = true;
@@ -440,10 +481,12 @@ void optimization::offlineOptimizationTask() {
 
     for (int i = 0; i < numPoses; ++i) {
         gtsam::Pose3 rtk_optimizedPose = initialEstimate.at<gtsam::Pose3>(i);
-        gtsam::Pose3 imu_optimizedPose = rtk_optimizedPose.compose((T_imu_rtk).inverse());
+        gtsam::Pose3 imu_optimizedPose = poses_are_antenna_
+            ? rtk_optimizedPose.compose(T_imu_rtk.inverse()) : rtk_optimizedPose;
         keyFrames[i].pose = imu_optimizedPose;
     }
 
+    poses_are_antenna_ = false;
     std::cout << "[Offline Optimization] Saving maps and trajectories..." << std::endl;
     //savekeyframescan();
     saveOptimizedGlobalMap();
@@ -731,13 +774,22 @@ double optimization::estimateVelocityTimeOffset(
 //Spacetime synchronization
 void optimization::initialAlign()
 {
-    //using spline
-    std::cout << " [initialAlign] initial align (using Spline)... " << std::endl;
+    std::cout << "[initialAlign] " << (gnss_options.enabled ? "quality-aware raw GNSS" : "legacy GNSS spline") << std::endl;
     gpsQueue_B.clear();
 
-    if (keyFrames.empty() || gpsQueue.empty()) {
+    if (!gps_en || keyFrames.empty() || gpsQueue.empty()) {
         ROS_WARN("[initialAlign] empty buffers.");
         return;
+    }
+
+    std::stable_sort(gpsQueue.begin(), gpsQueue.end(),
+        [](const GnssObservation& a, const GnssObservation& b) {
+            return a.odom.header.stamp < b.odom.header.stamp;
+        });
+    gnss::Recovery recovery;
+    for (auto& sample : gpsQueue) {
+        sample.decision = gnss::evaluate(sample.quality, gnss_options);
+        recovery.apply(sample.odom.header.stamp.toSec(), sample.quality, gnss_options, sample.decision);
     }
 
     std::vector<std::vector<double>> slam_position_data;
@@ -758,7 +810,9 @@ void optimization::initialAlign()
     std::vector<std::vector<double>> gps_velocity_data;
     gps_position_data.reserve(gpsQueue.size());
     gps_velocity_data.reserve(gpsQueue.size());
-    for (const auto& g : gpsQueue) {
+    for (const auto& sample : gpsQueue) {
+        if (gnss_options.enabled && !sample.decision.accepted) continue;
+        const auto& g = sample.odom;
         const auto& p = g.pose.pose.position;
         const auto& v = g.twist.twist.linear;
         gps_position_data.push_back({g.header.stamp.toSec(), p.x, p.y, p.z});
@@ -767,8 +821,11 @@ void optimization::initialAlign()
 
     const double slam_start = slam_position_data.front()[0];
     const double slam_end = slam_position_data.back()[0];
-    const double gps_start = gps_position_data.front()[0];
-    const double gps_end = gps_position_data.back()[0];
+    if (gps_position_data.empty()) return;
+    // Use the unfiltered endpoints for epoch conversion, so an invalid prefix
+    // does not shift the entire GNSS series relative to LIVO.
+    const double gps_start = gpsQueue.front().odom.header.stamp.toSec();
+    const double gps_end = gpsQueue.back().odom.header.stamp.toSec();
     const double raw_overlap = std::min(slam_end, gps_end) - std::max(slam_start, gps_start);
     const bool epoch_mismatch = raw_overlap < 5.0
                              || std::fabs(slam_start - gps_start) > 100.0
@@ -800,7 +857,7 @@ void optimization::initialAlign()
     if (std::fabs(applied_time_offset) > 1e-9) {
         const ros::Duration time_offset(applied_time_offset);
         for (auto& g : gpsQueue) {
-            g.header.stamp += time_offset;
+            g.odom.header.stamp += time_offset;
         }
     }
 
@@ -831,8 +888,8 @@ void optimization::initialAlign()
         time_offset_file << "velocity_zero_score " << zero_velocity_score << "\n";
         time_offset_file << "velocity_best_pairs " << best_velocity_pairs << "\n";
         time_offset_file << "applied_time_offset_sec " << applied_time_offset << "\n";
-        time_offset_file << "gps_start_after " << gpsQueue.front().header.stamp.toSec() << "\n";
-        time_offset_file << "gps_end_after " << gpsQueue.back().header.stamp.toSec() << "\n";
+        time_offset_file << "gps_start_after " << gpsQueue.front().odom.header.stamp.toSec() << "\n";
+        time_offset_file << "gps_end_after " << gpsQueue.back().odom.header.stamp.toSec() << "\n";
         time_offset_file.close();
     }
 
@@ -845,11 +902,17 @@ void optimization::initialAlign()
         ROS_WARN("[initialAlign] failed to generate time alignment plot: %s", plot_script.c_str());
     }
     
+    if (gnss_options.enabled) {
+        alignment_ok_ = alignQualityGnss();
+        return;
+    }
+
     struct Sample { double t; Eigen::Vector3d p; };
     std::vector<Sample> samp; 
     samp.reserve(gpsQueue.size());
     
-    for (const auto& g : gpsQueue) {
+    for (const auto& sample : gpsQueue) {
+        const auto& g = sample.odom;
         const double t = g.header.stamp.toSec();
         const auto& p  = g.pose.pose.position; 
         samp.push_back({ t, Eigen::Vector3d(p.x, p.y, p.z) });
@@ -954,20 +1017,20 @@ void optimization::initialAlign()
         if (gpsQueue.empty()) return nullptr;
 
         auto it_lower = std::lower_bound(gpsQueue.begin(), gpsQueue.end(), t_query,
-            [](const nav_msgs::Odometry& msg, double t) {
-                return msg.header.stamp.toSec() < t;
+            [](const GnssObservation& msg, double t) {
+                return msg.odom.header.stamp.toSec() < t;
             });
 
         if (it_lower == gpsQueue.begin()) {
-            return &(*it_lower);
+            return &it_lower->odom;
         }
 
         if (it_lower == gpsQueue.end()) {
-            return &(*std::prev(it_lower));
+            return &std::prev(it_lower)->odom;
         }
 
-        const nav_msgs::Odometry& after = *it_lower;
-        const nav_msgs::Odometry& before = *std::prev(it_lower);
+        const nav_msgs::Odometry& after = it_lower->odom;
+        const nav_msgs::Odometry& before = std::prev(it_lower)->odom;
 
         double dt_after = std::abs(after.header.stamp.toSec() - t_query);
         double dt_before = std::abs(t_query - before.header.stamp.toSec());
@@ -1042,7 +1105,175 @@ void optimization::initialAlign()
         keyFrames[i].pose = T_enu_gps;
     }
     
+    alignment_ok_ = true;
+    poses_are_antenna_ = true;
     ROS_INFO("[initialAlign] Spline-based alignment complete.");
+}
+
+bool optimization::alignQualityGnss()
+{
+    // Associate raw observations once, rather than duplicating spline samples.
+    // The time mismatch contributes motion uncertainty to each axis.
+    std::vector<int> selected(keyFrames.size(), -1);
+    for (size_t j = 0; j < gpsQueue.size(); ++j) {
+        auto& s = gpsQueue[j];
+        s.keyframe = -1;
+        if (!s.decision.accepted) { s.association = "quality_rejected"; continue; }
+        const double t = s.odom.header.stamp.toSec();
+        if (t < keyFrames.front().time || t > keyFrames.back().time) {
+            s.association = "outside_livo_interval";
+            continue;
+        }
+        auto it = std::lower_bound(keyFrames.begin(), keyFrames.end(), t,
+            [](const KeyFrame& k, double time) { return k.time < time; });
+        size_t k = static_cast<size_t>(it - keyFrames.begin());
+        if (k > 0 && t - keyFrames[k - 1].time <= keyFrames[k].time - t) --k;
+        s.time_difference = keyFrames[k].time - t;
+        if (std::abs(s.time_difference) > gnss_options.max_time_difference) {
+            s.association = "time_gap";
+            continue;
+        }
+        const auto& v = s.odom.twist.twist.linear;
+        const double base_xy = s.decision.sigma_xy * s.decision.sigma_xy;
+        const double base_z = s.decision.sigma_z * s.decision.sigma_z;
+        const double dt2 = s.time_difference * s.time_difference;
+        s.factor_sigmas << std::sqrt(base_xy + v.x*v.x*dt2),
+                           std::sqrt(base_xy + v.y*v.y*dt2),
+                           std::sqrt(base_z + v.z*v.z*dt2);
+        if (selected[k] >= 0) {
+            auto& previous = gpsQueue[static_cast<size_t>(selected[k])];
+            if (previous.factor_sigmas.head<2>().squaredNorm() <= s.factor_sigmas.head<2>().squaredNorm()) {
+                s.association = "duplicate_keyframe";
+                continue;
+            }
+            previous.keyframe = -1;
+            previous.association = "duplicate_keyframe";
+        }
+        selected[k] = static_cast<int>(j);
+        s.keyframe = static_cast<int>(k);
+        s.association = "matched";
+    }
+
+    std::vector<size_t> candidates;
+    std::vector<size_t> fixed;
+    for (size_t j = 0; j < gpsQueue.size(); ++j) {
+        const auto& s = gpsQueue[j];
+        if (s.keyframe < 0 || s.decision.sigma_xy > gnss_options.alignment_max_sigma_xy) continue;
+        candidates.push_back(j);
+        if (s.quality.status_known && s.quality.diff_soln && s.quality.carr_soln == 2)
+            fixed.push_back(j);
+    }
+    if (fixed.size() >= 6) candidates.swap(fixed);
+    if (candidates.size() < 6) {
+        ROS_WARN("[GNSS quality] Fewer than six reliable observations for alignment.");
+        return false;
+    }
+    const double start = gpsQueue[candidates.front()].odom.header.stamp.toSec();
+    std::vector<size_t> early;
+    for (size_t j : candidates)
+        if (gpsQueue[j].odom.header.stamp.toSec() <= start + 50.0) early.push_back(j);
+    if (early.size() >= 6) candidates.swap(early);
+
+    std::vector<Eigen::Vector3d> source, target;
+    std::vector<double> base_weights, weights;
+    for (size_t j : candidates) {
+        const auto& s = gpsQueue[j];
+        source.push_back(initialEstimate.at<gtsam::Pose3>(s.keyframe).compose(T_imu_rtk).translation());
+        const auto& p = s.odom.pose.pose.position;
+        target.emplace_back(p.x, p.y, p.z);
+        base_weights.push_back(1.0 / (s.decision.sigma_xy * s.decision.sigma_xy));
+    }
+    weights = base_weights;
+    Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d translation = Eigen::Vector3d::Zero();
+    // Weighted rigid alignment with Huber IRLS: a wrong fixed point must not
+    // establish the coordinate frame for the whole trajectory.
+    for (int iteration = 0; iteration < 10; ++iteration) {
+        const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
+        Eigen::Vector3d a = Eigen::Vector3d::Zero(), b = Eigen::Vector3d::Zero();
+        for (size_t n = 0; n < source.size(); ++n) {
+            a += weights[n] * source[n];
+            b += weights[n] * target[n];
+        }
+        a /= total; b /= total;
+        Eigen::Matrix3d cross = Eigen::Matrix3d::Zero();
+        for (size_t n = 0; n < source.size(); ++n)
+            cross += weights[n] * (target[n] - b) * (source[n] - a).transpose();
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(cross / total, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        if (svd.singularValues()(1) < 1e-4) {
+            ROS_WARN("[GNSS quality] Alignment motion is stationary or collinear; keeping LIVO.");
+            return false;
+        }
+        Eigen::Matrix3d sign = Eigen::Matrix3d::Identity();
+        sign(2, 2) = (svd.matrixU() * svd.matrixV().transpose()).determinant() < 0.0 ? -1.0 : 1.0;
+        rotation = svd.matrixU() * sign * svd.matrixV().transpose();
+        translation = b - rotation * a;
+        for (size_t n = 0; n < source.size(); ++n) {
+            const auto& s = gpsQueue[candidates[n]];
+            Eigen::Vector3d residual = rotation * source[n] + translation - target[n];
+            residual.x() /= s.decision.sigma_xy;
+            residual.y() /= s.decision.sigma_xy;
+            residual.z() /= s.decision.sigma_z;
+            const double distance = residual.norm();
+            weights[n] = base_weights[n] * std::min(1.0, gnss_options.huber_k / std::max(distance, 1e-12));
+        }
+    }
+    size_t inliers = 0;
+    for (size_t n = 0; n < weights.size(); ++n)
+        if (weights[n] >= base_weights[n] / 3.0) ++inliers;
+    if (inliers < 6) {
+        ROS_WARN("[GNSS quality] Insufficient consistent alignment observations; keeping LIVO.");
+        return false;
+    }
+    const gtsam::Pose3 transform(gtsam::Rot3(rotation), translation);
+    for (size_t i = 0; i < keyFrames.size(); ++i) {
+        const auto pose = transform.compose(initialEstimate.at<gtsam::Pose3>(i).compose(T_imu_rtk));
+        initialEstimate.update(i, pose);
+        keyFrames[i].pose = pose;
+    }
+    poses_are_antenna_ = true;
+    ROS_INFO("[GNSS quality] Alignment: %zu observations, %zu consistent, raw GNSS association.",
+             candidates.size(), inliers);
+    return true;
+}
+
+void optimization::writeGnssQualityLog()
+{
+    if (!gnss_options.enabled) return;
+    std::ofstream file(debug_optdata_path_ + "gnss_quality.csv");
+    if (!file) { ROS_WARN("[GNSS quality] Cannot write quality CSV."); return; }
+    file << "time_sec,status_known,valid_fix,fix_type,carr_soln,diff_soln,num_sv,p_dop,h_acc_m,v_acc_m,"
+            "quality_accepted,quality_reason,association,keyframe,time_difference_sec,"
+            "sigma_x_m,sigma_y_m,sigma_z_m,used,residual_m,robust_weight,information_x,information_y,information_z\n";
+    file << std::setprecision(12);
+    size_t used = 0, robust_downweighted = 0;
+    for (const auto& s : gpsQueue) {
+        const auto& q = s.quality;
+        const bool active = alignment_ok_ && s.keyframe >= 0;
+        double residual = std::numeric_limits<double>::quiet_NaN();
+        double robust_weight = 0.0;
+        if (active) {
+            const auto& p = s.odom.pose.pose.position;
+            Eigen::Vector3d r = initialEstimate.at<gtsam::Pose3>(s.keyframe).translation() - Eigen::Vector3d(p.x, p.y, p.z);
+            residual = r.norm();
+            const double normalized = r.cwiseQuotient(s.factor_sigmas).norm();
+            robust_weight = std::min(1.0, gnss_options.huber_k / std::max(normalized, 1e-12));
+            ++used;
+            if (robust_weight < 0.999) ++robust_downweighted;
+        }
+        file << s.odom.header.stamp.toSec() << ',' << q.status_known << ',' << q.valid_fix << ','
+             << q.fix_type << ',' << q.carr_soln << ',' << q.diff_soln << ',' << q.num_sv << ','
+             << q.p_dop << ',' << q.h_acc << ',' << q.v_acc << ',' << s.decision.accepted << ','
+             << s.decision.reason << ',' << (alignment_ok_ ? s.association : "alignment_unavailable") << ','
+             << s.keyframe << ',' << s.time_difference << ','
+             << s.factor_sigmas.x() << ',' << s.factor_sigmas.y() << ',' << s.factor_sigmas.z() << ','
+             << active << ',' << residual << ',' << robust_weight;
+        for (int axis = 0; axis < 3; ++axis)
+            file << ',' << (active ? robust_weight / (s.factor_sigmas(axis)*s.factor_sigmas(axis)) : 0.0);
+        file << '\n';
+    }
+    ROS_INFO("[GNSS quality] %zu/%zu raw observations used; %zu robustly downweighted. CSV: %s",
+             used, gpsQueue.size(), robust_downweighted, (debug_optdata_path_ + "gnss_quality.csv").c_str());
 }
 
 //build gtsam graph
@@ -1053,46 +1284,42 @@ void optimization::buildBatchGraph()
     ROS_INFO("rtk_cox, livo2_RPY_cov, livo2_XYZ_cov: %f, %f, %f", 
              rtk_cov, livo2_RPY_cov, livo2_XYZ_cov);
              
-    gtsam::noiseModel::Diagonal::shared_ptr priorNoise =
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
-    gtsam::noiseModel::Diagonal::shared_ptr odometryNoise = 
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov, livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov).finished());
-    gtsam::noiseModel::Diagonal::shared_ptr gps_noise =
-        gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(3) << rtk_cov, rtk_cov, 1).finished());
+    const bool dynamic = gnss_options.enabled && alignment_ok_;
+    // In dynamic mode GNSS determines global translation; the initial alignment
+    // is not an independent millimetre-accurate position measurement.
+    auto priorNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) <<
+        (dynamic ? 1e-4 : 1e-6), (dynamic ? 1e-4 : 1e-6), (dynamic ? 1e-4 : 1e-6),
+        (dynamic ? 100.0 : 1e-6), (dynamic ? 100.0 : 1e-6), (dynamic ? 100.0 : 1e-6)).finished());
+    auto odometryNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) <<
+        livo2_RPY_cov, livo2_RPY_cov, livo2_RPY_cov,
+        livo2_XYZ_cov, livo2_XYZ_cov, livo2_XYZ_cov).finished());
+    auto fixedNoise = gtsam::noiseModel::Diagonal::Variances(
+        (gtsam::Vector(3) << rtk_cov, rtk_cov, 1.0).finished());
 
-    size_t rtk_idx = 0; 
-
-    for (size_t i = 0; i < initialEstimate.size(); ++i)
-    {
-        // addpriorfactor and betweenfactor
-        if (i == 0)
-        {
-            gtsam::Pose3 priorPose_T_wa = initialEstimate.at<gtsam::Pose3>(0);
-            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, priorPose_T_wa, priorNoise));
+    for (size_t i = 0; i < initialEstimate.size(); ++i) {
+        const auto pose = initialEstimate.at<gtsam::Pose3>(i);
+        if (i == 0) {
+            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(i, pose, priorNoise));
+        } else {
+            const auto previous = initialEstimate.at<gtsam::Pose3>(i-1);
+            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(i-1, i, previous.between(pose), odometryNoise));
         }
-        else 
-        {
-            gtsam::Pose3 poseFrom_T_wa = initialEstimate.at<gtsam::Pose3>(i-1);
-            gtsam::Pose3 poseTo_T_wa   = initialEstimate.at<gtsam::Pose3>(i);
-            gtsam::Pose3 T_rel_ant_from_svd = poseFrom_T_wa.between(poseTo_T_wa);
-            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(i-1, i, T_rel_ant_from_svd, odometryNoise));
+        if (!gnss_options.enabled && alignment_ok_ && i < gpsQueue_B.size()) {
+            const auto& p = gpsQueue_B[i].pose.pose.position;
+            gtSAMgraph.add(gtsam::GPSFactor(i, gtsam::Point3(p.x, p.y, p.z), fixedNoise));
         }
-
-        // addrtkfactor
-        auto it = gpsQueue_B[i];
-        double x = it.pose.pose.position.x;
-        double y = it.pose.pose.position.y;
-        double z = it.pose.pose.position.z;
-        gtsam::Point3 gps_point(x, y, z);
-
-        double cov_x = it.pose.covariance[0]; 
-        double cov_y = it.pose.covariance[7]; 
-        double cov_z = it.pose.covariance[14]; 
-
-        gtSAMgraph.add(gtsam::GPSFactor(i, gps_point, gps_noise));
-
     }
-} 
+    if (dynamic) {
+        for (const auto& s : gpsQueue) {
+            if (s.keyframe < 0) continue;
+            const auto& p = s.odom.pose.pose.position;
+            const auto gaussian = gtsam::noiseModel::Diagonal::Sigmas(s.factor_sigmas);
+            const auto robust = gtsam::noiseModel::Robust::Create(
+                gtsam::noiseModel::mEstimator::Huber::Create(gnss_options.huber_k), gaussian);
+            gtSAMgraph.add(gtsam::GPSFactor(s.keyframe, gtsam::Point3(p.x, p.y, p.z), robust));
+        }
+    }
+}
 
 void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, const sensor_msgs::PointCloud2::ConstPtr& cloudMsg)
 {
@@ -1121,48 +1348,55 @@ void optimization::syncedCallback(const nav_msgs::Odometry::ConstPtr& odomMsg, c
 
 void optimization::gpsHandler(const gnss_comm::GnssPVTSolnMsg::ConstPtr& gpsMsg)
 {
-    Eigen::Vector3d trans_local_;
-    static bool first_gps = false;
-    if (!first_gps) {
-        first_gps = true;
-        gps_trans_.Reset(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!accepting_keyframes_ || !gps_en) return;
+    if (!std::isfinite(gpsMsg->latitude) || !std::isfinite(gpsMsg->longitude) ||
+        !std::isfinite(gpsMsg->altitude) || std::abs(gpsMsg->latitude) > 90.0 ||
+        std::abs(gpsMsg->longitude) > 180.0 || !std::isfinite(gpsMsg->time.tow) ||
+        gpsMsg->time.tow < 0.0 || gpsMsg->time.tow >= 604800.0) {
+        ROS_WARN_THROTTLE(5.0, "[GNSS quality] Dropping invalid GNSS coordinates/time.");
+        return;
     }
-
-    // GPS time to UNIX time
-    const double GPS_EPOCH_UNIX_TIME = 315964800.0;
-    const double SECONDS_PER_WEEK = 604800.0; 
-    const double LEAP_SECONDS = 18.0;
-    
-    int week = gpsMsg->time.week;
-    double tow = gpsMsg->time.tow; 
-    double total_gps_seconds = (double)week * SECONDS_PER_WEEK + tow;
-    double timestamp_sec = total_gps_seconds + GPS_EPOCH_UNIX_TIME - LEAP_SECONDS;
-    
-    ros::Time stamp;
-    stamp.fromSec(timestamp_sec);
-    gpstimestamp = timestamp_sec; 
-
-    gps_trans_.Forward(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude, 
-                       trans_local_[0], trans_local_[1], trans_local_[2]);
-
-    nav_msgs::Odometry gps_odom;
-    gps_odom.header.stamp = stamp - ros::Duration(gps_offset); 
-    gps_odom.header.frame_id = "map";
-    gps_odom.pose.pose.position.x = trans_local_[0];
-    gps_odom.pose.pose.position.y = trans_local_[1];
-    gps_odom.pose.pose.position.z = trans_local_[2];
-    gps_odom.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, 0.0);
-    
-    gps_odom.twist.twist.linear.x = gpsMsg->vel_e;
-    gps_odom.twist.twist.linear.y = gpsMsg->vel_n;
-    gps_odom.twist.twist.linear.z = -gpsMsg->vel_d;
-
-    gps_odom.pose.covariance[0]  = gpsMsg->h_acc; 
-    gps_odom.pose.covariance[7]  = gpsMsg->h_acc; 
-    gps_odom.pose.covariance[14] = gpsMsg->v_acc; 
-
-    pubGpsOdom.publish(gps_odom);
-    gpsQueue.push_back(gps_odom);
+    if (!gps_origin_initialized_) {
+        if (!gpsMsg->valid_fix || (gpsMsg->fix_type != 3 && gpsMsg->fix_type != 4)) return;
+        gps_trans_.Reset(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude);
+        gps_origin_initialized_ = true;
+    }
+    Eigen::Vector3d trans_local_;
+    gps_trans_.Forward(gpsMsg->latitude, gpsMsg->longitude, gpsMsg->altitude,
+                       trans_local_.x(), trans_local_.y(), trans_local_.z());
+    const double timestamp = 315964800.0 + gpsMsg->time.week * 604800.0 + gpsMsg->time.tow - 18.0;
+    if (timestamp - gps_offset < 0.0 || timestamp - gps_offset >= 4294967296.0) return;
+    GnssObservation sample;
+    auto& odom = sample.odom;
+    odom.header.stamp.fromSec(timestamp - gps_offset);
+    odom.header.frame_id = "map";
+    odom.pose.pose.position.x = trans_local_.x();
+    odom.pose.pose.position.y = trans_local_.y();
+    odom.pose.pose.position.z = trans_local_.z();
+    odom.pose.pose.orientation.w = 1.0;
+    // Non-finite velocity must not poison association or time estimation.
+    odom.twist.twist.linear.x = std::isfinite(gpsMsg->vel_e) ? gpsMsg->vel_e : 0.0;
+    odom.twist.twist.linear.y = std::isfinite(gpsMsg->vel_n) ? gpsMsg->vel_n : 0.0;
+    odom.twist.twist.linear.z = std::isfinite(gpsMsg->vel_d) ? -gpsMsg->vel_d : 0.0;
+    auto& q = sample.quality;
+    q.status_known = true;
+    q.valid_fix = gpsMsg->valid_fix;
+    q.fix_type = gpsMsg->fix_type;
+    q.diff_soln = gpsMsg->diff_soln;
+    q.carr_soln = gpsMsg->carr_soln;
+    q.num_sv = gpsMsg->num_sv;
+    q.p_dop = gpsMsg->p_dop;
+    q.h_acc = gpsMsg->h_acc;
+    q.v_acc = gpsMsg->v_acc;
+    q.vel_acc = gpsMsg->vel_acc;
+    sample.decision = gnss::evaluate(q, gnss_options);
+    if (sample.decision.accepted) {
+        odom.pose.covariance[0] = odom.pose.covariance[7] = sample.decision.sigma_xy * sample.decision.sigma_xy;
+        odom.pose.covariance[14] = sample.decision.sigma_z * sample.decision.sigma_z;
+    }
+    if (pubGpsOdom) pubGpsOdom.publish(odom);
+    gpsQueue.push_back(sample);
 }
 
 void optimization::savekeyframescan()
@@ -1180,17 +1414,6 @@ void optimization::savekeyframescan()
 
 void optimization::saveOptimizedGlobalMap()
 {
-    PointCloudXYZRGB::Ptr globalMapCloud(new PointCloudXYZRGB());
-
-    for (size_t i = 0; i < keyFrames.size(); ++i)
-    {
-        Eigen::Affine3f transform = poseToAffine3f(keyFrames[i].pose);
-        PointCloudXYZRGB::Ptr original_cloud = keyFrames[i].cloud;
-        PointCloudXYZRGB::Ptr transformed_cloud(new PointCloudXYZRGB());
-        pcl::transformPointCloud(*original_cloud, *transformed_cloud, transform);
-        *globalMapCloud += *transformed_cloud;
-    }
-    
     std::string save_path;
     if (is_optimized) 
     {
@@ -1200,7 +1423,40 @@ void optimization::saveOptimizedGlobalMap()
     {
         save_path = global_map_pcd_path_ + "before_optimization.pcd";
     }
-    pcl::io::savePCDFileBinary(save_path, *globalMapCloud);
+    // Keep only one transformed keyframe in memory. Concatenating the full map
+    // temporarily duplicates millions of points and can exhaust an 8 GB machine.
+    size_t point_count = 0;
+    for (const auto& frame : keyFrames) {
+        if (frame.cloud) point_count += frame.cloud->size();
+    }
+    if (point_count >= static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("Global map exceeds the PCD header point limit");
+    }
+
+    std::ofstream output(save_path, std::ios::binary | std::ios::trunc);
+    output.exceptions(std::ios::failbit | std::ios::badbit);
+    PointCloudXYZRGB transformed;
+    output << pcl::PCDWriter::generateHeader(transformed, static_cast<int>(point_count))
+           << "DATA binary\n";
+
+    struct PackedPoint {
+        float x, y, z;
+        std::uint32_t rgb;
+    };
+    static_assert(sizeof(PackedPoint) == 16, "PCD XYZRGB fields must occupy 16 bytes");
+    std::vector<PackedPoint> packed;
+    for (const auto& frame : keyFrames) {
+        if (!frame.cloud || frame.cloud->empty()) continue;
+        pcl::transformPointCloud(*frame.cloud, transformed, poseToAffine3f(poses_are_antenna_ ? frame.pose.compose(T_imu_rtk.inverse()) : frame.pose));
+        packed.clear();
+        packed.reserve(transformed.size());
+        for (const auto& point : transformed) {
+            packed.push_back({point.x, point.y, point.z, point.rgba});
+        }
+        output.write(reinterpret_cast<const char*>(packed.data()),
+                     static_cast<std::streamsize>(packed.size() * sizeof(PackedPoint)));
+    }
+    output.close();
 }
 
 void optimization::writeTumTrajectory(const std::string& path) {
@@ -1213,8 +1469,9 @@ void optimization::writeTumTrajectory(const std::string& path) {
     tum_file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
     tum_file << std::fixed << std::setprecision(6);
     for (const auto& keyframe : keyFrames) {
-        const auto& t = keyframe.pose.translation();
-        const auto q = keyframe.pose.rotation().toQuaternion();
+        const auto pose = poses_are_antenna_ ? keyframe.pose.compose(T_imu_rtk.inverse()) : keyframe.pose;
+        const auto& t = pose.translation();
+        const auto q = pose.rotation().toQuaternion();
         tum_file << keyframe.time << " "
                  << t.x() << " " << t.y() << " " << t.z() << " "
                  << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
@@ -1236,7 +1493,8 @@ void optimization::writeRtkTumTrajectory() {
     tum_file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
     tum_file << std::fixed << std::setprecision(6);
 
-    for (const auto& odom_msg : gpsQueue) {
+    for (const auto& sample : gpsQueue) {
+        const auto& odom_msg = sample.odom;
         tum_file << odom_msg.header.stamp.toSec() << " " 
                  << odom_msg.pose.pose.position.x << " " 
                  << odom_msg.pose.pose.position.y << " " 
@@ -1270,10 +1528,23 @@ void optimization::loadData(const std::string& data_dir)
             double t, x, y, z;
             double vx = 0.0, vy = 0.0, vz = 0.0;
             double h_acc = 0.0, v_acc = 0.0;
-            ss >> t >> x >> y >> z;
+            if (!(ss >> t >> x >> y >> z) || !std::isfinite(t) || t - gps_offset < 0.0 ||
+                t - gps_offset >= 4294967296.0 || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                ROS_WARN("[GNSS quality] Skipping malformed legacy GNSS row.");
+                continue;
+            }
             ss >> vx >> vy >> vz >> h_acc >> v_acc;
-            
-            nav_msgs::Odometry gps_msg;
+            GnssObservation sample;
+            auto& q = sample.quality;
+            q.h_acc = h_acc;
+            q.v_acc = v_acc;
+            int valid = 1, differential = 0;
+            if (ss >> q.fix_type >> valid >> differential >> q.carr_soln >> q.num_sv >> q.p_dop >> q.vel_acc) {
+                q.status_known = true;
+                q.valid_fix = valid != 0;
+                q.diff_soln = differential != 0;
+            }
+            auto& gps_msg = sample.odom;
             gps_msg.header.stamp = ros::Time().fromSec(t) - ros::Duration(gps_offset);
             gps_msg.header.frame_id = "map"; 
 
@@ -1284,11 +1555,14 @@ void optimization::loadData(const std::string& data_dir)
             gps_msg.twist.twist.linear.x = vx;
             gps_msg.twist.twist.linear.y = vy;
             gps_msg.twist.twist.linear.z = vz;
-            gps_msg.pose.covariance[0] = h_acc;
-            gps_msg.pose.covariance[7] = h_acc;
-            gps_msg.pose.covariance[14] = v_acc;
-
-            gpsQueue.push_back(gps_msg);
+            q.h_acc = h_acc;
+            q.v_acc = v_acc;
+            sample.decision = gnss::evaluate(q, gnss_options);
+            if (sample.decision.accepted) {
+                gps_msg.pose.covariance[0] = gps_msg.pose.covariance[7] = sample.decision.sigma_xy * sample.decision.sigma_xy;
+                gps_msg.pose.covariance[14] = sample.decision.sigma_z * sample.decision.sigma_z;
+            }
+            gpsQueue.push_back(sample);
             rtk_count++;
         }
         rtk_file.close();
