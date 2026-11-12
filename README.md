@@ -1,6 +1,10 @@
-# FAST-LIVO2-RTK
+# FAST-LIVO2-DynamicRTK
 
-FAST-LIVO2-RTK extends FAST-LIVO2 with RTK/GNSS-constrained global optimization for long-term LiDAR-visual mapping.
+在 [FAST-LIVO2-RTK](https://github.com/xuankuzcr/FAST-LIVO2-RTK) 基础上，实现了根据 RTK 数据质量动态调整轨迹。
+
+新增功能包括 GNSS 状态分级、逐点测量协方差、Huber 异常降权、质量日志和离线后端对比验证。配置和验证方法见 [GNSS 动态权重说明](docs/gnss_dynamic_weighting.md)；本机运行方法见 [Docker 使用说明](docker/README.zh-CN.md)。
+
+The upstream FAST-LIVO2-RTK project extends FAST-LIVO2 with RTK/GNSS-constrained global optimization for long-term LiDAR-visual mapping.
 
 **Key highlights include:**
 
